@@ -1,0 +1,489 @@
+diff --git a/src/FrameBuffer.cpp b/src/FrameBuffer.cpp
+index 9d6ba51..db86f7a 100644
+--- a/src/FrameBuffer.cpp
++++ b/src/FrameBuffer.cpp
+@@ -1463,6 +1463,83 @@ void FrameBufferList::OverscanBuffer::draw(u32 _fullHeight, bool _PAL)
+ 	drawer.copyTexturedRect(blitParams);
+ }
+ 
++/* mupen64plus-VR: dual-render — present THIS pass's just-rendered buffer through
++ * GLideN64's REAL present pipeline (renderBuffer: VI crop, letterbox, aspect,
++ * overscan, field windowing, buffer-seam split blits) by pointing the VI origin at
++ * the buffer for the duration of the call. eye 0 swaps stage-only (core uploads
++ * LEFT, no XR frame, no window swap); eye 1 swaps as the present (RIGHT + XR +
++ * window). History: a raw full-FBO blit here kept the eyes coherent but showed
++ * rows the VI never displays — letterboxed scenes (GE credits) grew a garbage
++ * band across the bottom quarter and the in-level HUD glitched (field report +
++ * screenshot, 2026-07-16 22:00). Reusing renderBuffer is the only correct crop.
++ *
++ * The per-buffer VI-origin delta (the interlace field line the game programs) is
++ * remembered from real scanouts and re-applied, so the de-bob the old right eye
++ * enjoyed comes through the same math. Unknown buffer => delta 0. */
++int g_vr_composite_active = 0;   /* lets our re-entrant renderBuffer call through the dual suppress */
++
++void g_vr_composite_eye(unsigned eye)
++{
++	FrameBuffer * pBuffer = frameBufferList().getCurrent();
++	if (pBuffer == nullptr || pBuffer->m_pTexture == nullptr)
++		return;
++
++	extern void g_vr_report_eye(unsigned eye);   /* gSP.cpp */
++	extern void g_vr_set_swap_mode(int mode);    /* gSP.cpp */
++
++	/* Per-buffer origin delta, learned from what the game really programs. */
++	u32 delta = 0;
++	{
++		/* Per-buffer VI-origin delta map (per-process). 4-slot ring: a start address
++		 * with no matching and no empty slot overwrites round-robin, so a full map
++		 * keeps learning and stale entries self-heal instead of the map wedging. */
++		static u32 s_bobStart[4] = { 0, 0, 0, 0 };
++		static u32 s_bobDelta[4] = { 0, 0, 0, 0 };
++		static int s_bobNext = 0;                 /* ring write index for eviction */
++		const u32 vio = (*REG.VI_ORIGIN) & 0xFFFFFF;
++		FrameBuffer * pVIBuf = frameBufferList().findBuffer(vio);
++		if (pVIBuf != nullptr && vio >= pVIBuf->m_startAddress) {
++			const u32 d = vio - pVIBuf->m_startAddress;
++			if (d < 0x8000) {                     /* windowing offsets are small */
++				int slot = -1;
++				for (int i = 0; i < 4 && slot < 0; ++i)
++					if (s_bobStart[i] == pVIBuf->m_startAddress) slot = i;
++				for (int i = 0; i < 4 && slot < 0; ++i)
++					if (s_bobStart[i] == 0) slot = i;
++				if (slot < 0) {                       /* map full, no match: evict round-robin */
++					slot = s_bobNext;
++					s_bobNext = (s_bobNext + 1) & 3;
++				}
++				s_bobStart[slot] = pVIBuf->m_startAddress; s_bobDelta[slot] = d;
++			}
++		}
++		for (int i = 0; i < 4; ++i)
++			if (s_bobStart[i] == pBuffer->m_startAddress) { delta = s_bobDelta[i]; break; }
++	}
++
++	const u32 savedOrigin = *REG.VI_ORIGIN;
++	*REG.VI_ORIGIN = pBuffer->m_startAddress + delta;
++
++	g_vr_report_eye(eye);
++	g_vr_set_swap_mode(eye == 0u ? 1 : 0);
++	g_vr_composite_active = 1;
++	frameBufferList().renderBuffer();            /* full pipeline; swaps inside */
++	g_vr_composite_active = 0;
++	g_vr_set_swap_mode(0);
++	*REG.VI_ORIGIN = savedOrigin;
++
++	static int trace = -1;
++	if (trace < 0) trace = (getenv("MUPEN_VR_TRACE") != NULL) ? 1 : 0;
++	if (trace) {
++		static int n = 0;
++		if (n < 480)
++			fprintf(stderr, "[VRp] comp%c  #%03d start=%06x delta=%u\n",
++			        eye == 0u ? 'L' : 'R', n++, pBuffer->m_startAddress, delta);
++	}
++
++	frameBufferList().setCurrentDrawBuffer();    /* restore the draw FB for the next pass */
++}
++
+ void FrameBufferList::renderBuffer()
+ {
+ 	if (g_debugger.isDebugMode()) {
+@@ -1470,6 +1547,19 @@ void FrameBufferList::renderBuffer()
+ 		return;
+ 	}
+ 
++	/* mupen64plus-VR: in dual-render, BOTH eyes are composited and swapped at
++	 * end-of-dlist by g_vr_composite_eye (same source frame, same math). This VI
++	 * present would composite the VI SCANOUT buffer — the previous frame, through
++	 * different rect math — and re-introduce the one-frame inter-eye lag it took
++	 * a headset trace to convict. Dual mode presents nothing from here EXCEPT the
++	 * re-entrant calls g_vr_composite_eye itself makes to reuse this pipeline. */
++	{
++		extern int g_vr_dual_active;         /* gSP.cpp */
++		extern int g_vr_composite_active;    /* below */
++		if (g_vr_dual_active != 0 && g_vr_composite_active == 0)
++			return;
++	}
++
+ 	if (config.frameBufferEmulation.enable == 0) {
+ 		_renderScreenSizeBuffer();
+ 		return;
+@@ -1670,6 +1760,33 @@ void FrameBufferList::renderBuffer()
+ 	gfxContext.bindFramebuffer(bufferTarget::READ_FRAMEBUFFER, ObjectHandle::defaultFramebuffer);
+ 	m_overscan.draw(vFullHeight, rdpRes.vi_ispal);
+ 
++	/* mupen64plus-VR: report the eye of the pixels we just composited, immediately
++	 * before the swap — the core's readback hook (inside swapBuffers) pairs the
++	 * readback with this eye. This natural present reports ONLY in temporal/mono mode,
++	 * reading the eye from the travelling buffer tag (pBuffer->m_vrEye). DUAL mode
++	 * never presents from here: its natural VI call already returned at the
++	 * g_vr_dual_active/g_vr_composite_active gate near the top of renderBuffer, and it
++	 * composites and reports each eye via g_vr_composite_eye, whose re-entrant
++	 * renderBuffer call sets g_vr_composite_active, so the guard below skips this
++	 * block. */
++	{
++		extern void g_vr_report_eye(unsigned eye);   /* gSP.cpp */
++		extern int  g_vr_dual_active;                /* gSP.cpp */
++		extern int  g_vr_composite_active;           /* g_vr_composite_eye set the eye already */
++		if (g_vr_composite_active == 0) {
++			const unsigned vr_eye = g_vr_dual_active ? 1u : pBuffer->m_vrEye;
++			g_vr_report_eye(vr_eye);
++			static int trace = -1;
++			if (trace < 0) trace = (getenv("MUPEN_VR_TRACE") != NULL) ? 1 : 0;
++			if (trace) {
++				static int n = 0;
++				if (n < 120)
++					fprintf(stderr, "[VRp] present #%03d eye=%u (tag=%u dual=%d)\n",
++					        n++, vr_eye, pBuffer->m_vrEye, g_vr_dual_active);
++			}
++		}
++	}
++
+ 	wnd.swapBuffers();
+ 	if (m_pCurrent != nullptr) {
+ 		gfxContext.bindFramebuffer(bufferTarget::DRAW_FRAMEBUFFER, m_pCurrent->m_FBO);
+diff --git a/src/FrameBuffer.h b/src/FrameBuffer.h
+index 6e06dae..2946ce5 100644
+--- a/src/FrameBuffer.h
++++ b/src/FrameBuffer.h
+@@ -46,6 +46,7 @@ struct FrameBuffer
+ 	u32 m_originX = 0;
+ 	u32 m_originY = 0;
+ 	u32 m_swapCount = 0;
++	u32 m_vrEye = 0;	// mupen64plus-VR: eye this buffer was rendered with (0=L, 1=R); reported at present
+ 	float m_scale = 0.0f;
+ 	bool m_copiedToRdram = false;
+ 	bool m_fingerprint = false;
+diff --git a/src/RSP.cpp b/src/RSP.cpp
+index b66c782..1804a53 100644
+--- a/src/RSP.cpp
++++ b/src/RSP.cpp
+@@ -1,5 +1,7 @@
+ #include <algorithm>
++#include <dlfcn.h>   // mupen64plus-VR: dlsym(CoreVR_GetStereo)
+ #include <cstring>
++#include <cstdlib>
+ #include "DebugDump.h"
+ #include "RSP.h"
+ #include "RDP.h"
+@@ -107,16 +109,73 @@ void RSP_CheckDLCounter()
+ 	}
+ }
+ 
++/* mupen64plus-VR: stereo state (see the blocks inside RSP_ProcessDList). */
++static int      s_vr_on = -1;
++static int      s_vr_dual = 0;   /* GLN64_VR_DUAL=1: render BOTH eyes each frame */
++static float    s_vr_sep = 0.0f, s_vr_conv = 0.0f;
++static unsigned s_vr_frame = 0, s_vr_cur_eye = 0;
++
+ void RSP_ProcessDList()
+ {
+ 	RSP.LLE = false;
+ 
++	/* mupen64plus-VR: stereo config (env-driven). The per-eye vertex offset is applied
++	 * in gSPProcessVertex; the rendered BUFFER is tagged with its eye at the end of
++	 * this function and reported at present time (the tag travels with the pixels).
++	 * GLN64_VR_DUAL=1 renders BOTH eyes each frame (two passes over the same dlist —
++	 * the setup below re-reads everything from DMEM, so a re-run reproduces the frame);
++	 * otherwise eyes alternate across frames (temporal). */
++	if (s_vr_on < 0) {
++		s_vr_on   = (getenv("MUPEN_VR") != NULL) ? 1 : 0;
++		s_vr_dual = (getenv("GLN64_VR_DUAL") != NULL && atoi(getenv("GLN64_VR_DUAL")) != 0) ? 1 : 0;
++		const char* s = getenv("GLN64_VR_SEP");
++		const char* c = getenv("GLN64_VR_CONV");
++		s_vr_sep  = s ? (float)atof(s) : 0.010f;
++		s_vr_conv = c ? (float)atof(c) : 0.0f;
++		/* mupen64plus-VR: prefer the core's RESOLVED per-game stereo (profile precedence)
++		 * when the VR-enabled core exports it; the env vars above are the stock-core
++		 * fallback. Resolved once here (ROM open + profile resolution have already run). */
++		typedef void (*get_stereo_fn)(float*, float*);
++		extern void* g_vr_core_sym(const char* name);   /* gSP.cpp */
++		get_stereo_fn core_get_stereo = (get_stereo_fn)g_vr_core_sym("CoreVR_GetStereo");
++		if (core_get_stereo != NULL) {
++			float sep = s_vr_sep, conv = s_vr_conv;
++			core_get_stereo(&sep, &conv);
++			s_vr_sep = sep; s_vr_conv = conv;
++		}
++		extern int g_vr_dual_active;                    /* gSP.cpp */
++		g_vr_dual_active = (s_vr_on > 0 && s_vr_dual > 0) ? 1 : 0;
++		extern int g_vr_wstats_on;                      /* gSP.cpp: [VRw] clip-w capture */
++		g_vr_wstats_on = (getenv("MUPEN_VR_TRACE") != NULL) ? 1 : 0;
++		if (getenv("MUPEN_VR_TRACE") != NULL)
++			fprintf(stderr, "[VRp] stereo init: on=%d dual=%d sep=%.4f conv=%.3f bridge=%s\n",
++			        s_vr_on, s_vr_dual, s_vr_sep, s_vr_conv,
++			        core_get_stereo ? "core" : "env-fallback");
++	}
++
+ 	if (ConfigOpen || dwnd().isResizeWindow()) {
+ 		*REG.MI_INTR |= MI_INTR_DP;
+ 		CheckInterrupts();
+ 		return;
+ 	}
+ 
++	/* Dual-render: pass 0 = LEFT (staged mid-frame via g_vr_stage_left), pass 1 = RIGHT
++	 * (presented by the natural VI path). An infloop resume continues a partial dlist,
++	 * so dual is skipped for that call. */
++	const int vr_dual   = (s_vr_on > 0 && s_vr_dual > 0 && !RSP.infloop) ? 1 : 0;
++	const int vr_passes = vr_dual ? 2 : 1;
++	for (int vr_pass = 0; vr_pass < vr_passes; ++vr_pass) {
++
++	{
++		extern float g_vr_eye, g_vr_sep, g_vr_conv;
++		if (s_vr_on > 0) {
++			s_vr_cur_eye = vr_dual ? (unsigned)vr_pass : (s_vr_frame++ & 1u);
++			g_vr_eye  = s_vr_cur_eye ? 1.0f : -1.0f;
++			g_vr_sep  = s_vr_sep;
++			g_vr_conv = s_vr_conv;
++		}
++	}
++
+ 	if (RSP.infloop) {
+ 		RSP.infloop = false;
+ 		RSP.halt = false;
+@@ -195,6 +254,25 @@ void RSP_ProcessDList()
+ 		return;
+ 	}
+ 
++	/* Dual-render: composite the just-rendered buffer through the ONE shared path
++	 * (FrameBuffer.cpp g_vr_composite_eye) — pass 0 = LEFT, stage-only swap; pass 1 =
++	 * RIGHT, present swap (XR frame + window). Same source frame, same blit math for
++	 * both eyes; the natural VI present is suppressed in dual mode (renderBuffer would
++	 * show the PREVIOUS frame's scanout and un-pair the eyes).
++	 *
++	 * ORDERING (Perfect Dark depth copy): only the LEFT eye is composited here, in the
++	 * loop. The RIGHT eye is deferred to AFTER the copyDepthToRDRAM block below, because
++	 * that block's PD path only runs when rectDepthBufferCopyFrame (stamped DURING the
++	 * dlist run) still equals dwnd().getBuffersSwapCount(), and every composite's
++	 * swapBuffers() advances that count. Compositing the RIGHT eye here would push the
++	 * count past pass 1's stamp before the check and permanently skip PD's depth copy. */
++	if (vr_dual && vr_pass == 0) {
++		extern void g_vr_composite_eye(unsigned eye);
++		g_vr_composite_eye(0u);
++	}
++
++	} /* vr_pass loop */
++
+ 	if (config.frameBufferEmulation.copyDepthToRDRAM != Config::cdDisable) {
+ 		if ((config.generalEmulation.hacks & hack_rectDepthBufferCopyCBFD) != 0) {
+ 			; // do nothing
+@@ -205,6 +283,41 @@ void RSP_ProcessDList()
+ 			FrameBuffer_CopyDepthBuffer(gDP.colorImage.address);
+ 	}
+ 
++	/* mupen64plus-VR: RIGHT-eye composite (dual), deferred to here — AFTER the
++	 * copyDepthToRDRAM block above — so that block still sees rectDepthBufferCopyFrame
++	 * == dwnd().getBuffersSwapCount() and Perfect Dark's per-frame depth copy runs.
++	 * Hand-walk of the dual timeline (swap count C at dlist entry):
++	 *   pass0 stamps rectDepthBufferCopyFrame = C during its dlist run
++	 *   -> compositeL swaps the count C -> C+1 (LEFT, in the loop above)
++	 *   -> pass1 RE-stamps rectDepthBufferCopyFrame = C+1 during its dlist run
++	 *   -> depth check: getBuffersSwapCount() C+1 == stamp C+1  => PD copy RUNS
++	 *   -> compositeR swaps the count C+1 -> C+2 (RIGHT, here).
++	 * The LEFT composite advanced the count before pass 1's stamp, so it never
++	 * disturbs the equality the check depends on. */
++	if (vr_dual) {
++		extern void g_vr_composite_eye(unsigned eye);
++		g_vr_composite_eye(1u);
++	}
++
++	/* mupen64plus-VR: tag the buffer this dlist rendered into with its eye, so the
++	 * present path (renderBuffer) reports the RIGHT eye for the pixels it actually
++	 * composites — immune to dlist/present ordering races. */
++	if (s_vr_on > 0) {
++		FrameBuffer* pB = frameBufferList().getCurrent();
++		if (pB != nullptr)
++			pB->m_vrEye = s_vr_cur_eye;
++	}
++
++	/* mupen64plus-VR: flush the clip-w calibration stats every ~2 s (gSP.cpp
++	 * collects them on left-eye vertices; once per frame, after both passes). */
++	{
++		extern int g_vr_wstats_on;
++		extern void g_vr_wstats_dump();
++		static unsigned wdump_ctr = 0;
++		if (g_vr_wstats_on != 0 && (++wdump_ctr % 120u) == 0u)
++			g_vr_wstats_dump();
++	}
++
+ 	RSP.busy = false;
+ 	gDP.changed |= CHANGED_COLORBUFFER;
+ }
+diff --git a/src/gSP.cpp b/src/gSP.cpp
+index 8ed1fbb..e9e31d8 100644
+--- a/src/gSP.cpp
++++ b/src/gSP.cpp
+@@ -12,6 +12,156 @@
+ #include "gSP.h"
+ #include "gDP.h"
+ #include "3DMath.h"
++
++/* mupen64plus-VR: temporal per-eye stereo state, set once per frame by
++ * RSP_ProcessDList (RSP.cpp) and consumed in gSPProcessVertex. eye 0 == off/mono. */
++float g_vr_eye  = 0.0f;   /* -1 left, +1 right */
++float g_vr_sep  = 0.0f;   /* separation */
++float g_vr_conv = 0.0f;   /* convergence (w units) */
++
++/* mupen64plus-VR: report the eye of the buffer being PRESENTED to the core
++ * (CoreVR_SetStereoEye, resolved once from the loaded core's exports). Called from
++ * FrameBufferList::renderBuffer immediately before the swap, so the core's readback
++ * hook pairs the pixels with the right eye — the tag travels with the frame. */
++#ifndef OS_WINDOWS
++#include <dlfcn.h>
++#endif
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <cmath>
++
++/* mupen64plus-VR: 1 while dual-render is active (RSP.cpp sets it) — the present
++ * path then labels its eye from control flow, not the buffer tag. */
++int g_vr_dual_active = 0;
++
++/* mupen64plus-VR: clip-w distribution capture (MUPEN_VR_TRACE=1) — the calibration
++ * feed for per-game stereo convergence. Collected on LEFT-eye perspective vertices
++ * (one pass per frame, HUD/ortho already excluded by the offset gate), dumped by
++ * RSP.cpp every ~2 s as a [VRw] line with log2-bucket percentile estimates. The
++ * profile rule consuming it: convergence = p05 * 0.95 (zero-parallax sits just
++ * inside the scene's near band; everything else recedes behind the screen). */
++int g_vr_wstats_on = 0;                     /* RSP.cpp sets it from MUPEN_VR_TRACE */
++static unsigned s_wbucket[26];              /* w in [2^-6, 2^19) by frexpf exponent */
++static float    s_wmin = 0.0f, s_wmax = 0.0f;
++static unsigned s_wcount = 0;
++
++static inline void vr_wstat_add(float w)
++{
++	int e;
++	if (!(w > 0.0f)) return;                /* skip non-positive and NaN */
++	if (s_wcount == 0u) s_wmin = s_wmax = w;
++	else { if (w < s_wmin) s_wmin = w; if (w > s_wmax) s_wmax = w; }
++	(void)frexpf(w, &e);
++	e += 6;                                 /* bucket 0 == [2^-6, 2^-5) */
++	if (e < 0) e = 0; else if (e > 25) e = 25;
++	++s_wbucket[e];
++	++s_wcount;
++}
++
++static float vr_wstat_percentile(float p)
++{
++	const unsigned target = (unsigned)(p * (float)s_wcount);
++	unsigned cum = 0;
++	for (int i = 0; i < 26; ++i) {
++		cum += s_wbucket[i];
++		if (cum >= target) {
++			/* frexpf exponent e covers values [2^(e-1), 2^e); i == e+6.
++			 * Midpoint 1.5*2^(e-1) == ldexpf(1.5, i-7); clamp into the exact
++			 * observed range so coarse buckets can't report p05 > max. */
++			float est = ldexpf(1.5f, i - 7);
++			if (est < s_wmin) est = s_wmin;
++			if (est > s_wmax) est = s_wmax;
++			return est;
++		}
++	}
++	return s_wmax;
++}
++
++void g_vr_wstats_dump()
++{
++	if (s_wcount < 500u) { s_wcount = 0u; std::memset(s_wbucket, 0, sizeof(s_wbucket)); return; }
++	const float p05 = vr_wstat_percentile(0.05f);
++	std::fprintf(stderr,
++	    "[VRw] n=%u w: min=%.2f p05~%.2f p50~%.2f p95~%.2f max=%.2f -> conv hint %.2f\n",
++	    s_wcount, s_wmin, p05, vr_wstat_percentile(0.50f), vr_wstat_percentile(0.95f),
++	    s_wmax, p05 * 0.95f);
++	std::memset(s_wbucket, 0, sizeof(s_wbucket));
++	s_wcount = 0u;
++}
++
++/* mupen64plus-VR: resolve a core handshake export. dlsym(RTLD_DEFAULT) only sees
++ * the core if the front-end loaded it with RTLD_GLOBAL (most do NOT — verified:
++ * it returns NULL under stock mupen64plus-ui-console) or if the VR core promoted
++ * itself at CoreStartup. Fall back to a NOLOAD dlopen of the core by soname: it
++ * returns a handle to the ALREADY-LOADED library (loads nothing new) and dlsym
++ * on that handle always works. MUPEN_VR_TRACE=1 logs each resolution. */
++void* g_vr_core_sym(const char* name)
++{
++#ifndef OS_WINDOWS
++	void* sym = dlsym(RTLD_DEFAULT, name);
++	if (sym == nullptr) {
++		static void* core_handle = nullptr;
++		static int core_resolved = 0;
++		if (!core_resolved) {
++			core_resolved = 1;
++			static const char* const sonames[] = { "libmupen64plus.so.2", "libmupen64plusd.so.2" };
++			for (const char* s : sonames) {
++				core_handle = dlopen(s, RTLD_NOW | RTLD_NOLOAD);
++				if (core_handle != nullptr)
++					break;
++			}
++		}
++		if (core_handle != nullptr)
++			sym = dlsym(core_handle, name);
++	}
++	static int trace = -1;
++	if (trace < 0) trace = (getenv("MUPEN_VR_TRACE") != nullptr) ? 1 : 0;
++	if (trace)
++		std::fprintf(stderr, "[VRp] core symbol %s = %p\n", name, sym);
++	return sym;
++#else
++	(void)name;
++	return nullptr;
++#endif
++}
++
++void g_vr_report_eye(unsigned eye)
++{
++#ifndef OS_WINDOWS
++	typedef void (*set_eye_fn)(int);
++	static set_eye_fn set_eye = nullptr;
++	static int resolved = 0;
++	if (!resolved) {
++		resolved = 1;
++		set_eye = (set_eye_fn)g_vr_core_sym("CoreVR_SetStereoEye");
++	}
++	if (set_eye != nullptr)
++		set_eye((int)eye);
++#else
++	(void)eye;
++#endif
++}
++
++/* mupen64plus-VR: dual-render swap-mode channel (CoreVR_SetSwapMode). mode 1 marks the
++ * next swap stage-only (the core uploads the readback but drives no XR frame and skips
++ * the window swap); mode 0 restores normal stage+present. */
++void g_vr_set_swap_mode(int mode)
++{
++#ifndef OS_WINDOWS
++	typedef void (*set_mode_fn)(int);
++	static set_mode_fn set_mode = nullptr;
++	static int resolved = 0;
++	if (!resolved) {
++		resolved = 1;
++		set_mode = (set_mode_fn)g_vr_core_sym("CoreVR_SetSwapMode");
++	}
++	if (set_mode != nullptr)
++		set_mode(mode);
++#else
++	(void)mode;
++#endif
++}
+ #include "CRC.h"
+ #include "VI.h"
+ #include "FrameBuffer.h"
+@@ -1176,6 +1326,19 @@ void gSPProcessVertex(u32 v, SPVertex * spVtx)
+ 
+ 	gSPTransformVertex<VNUM>(v, spVtx, gSP.matrix.combined );
+ 
++	/* mupen64plus-VR: temporal per-eye stereo. Shift clip-space x by
++	 * eye*sep*(w - conv) so each eye sees a horizontally-offset render (depth on the
++	 * virtual screen). Perspective draws only — ortho/2D HUD has projection[3][3]==1
++	 * and is left flat. g_vr_* are set per frame by RSP_ProcessDList (RSP.cpp). */
++	if (g_vr_eye != 0.0f && gSP.matrix.projection[3][3] == 0.0f) {
++		for (u32 k = 0; k < VNUM; ++k) {
++			SPVertex & sv = spVtx[v + k];
++			if (g_vr_wstats_on != 0 && g_vr_eye < 0.0f)
++				vr_wstat_add(sv.w);         /* left pass only: one sample per frame */
++			sv.x += g_vr_eye * g_vr_sep * (sv.w - g_vr_conv);
++		}
++	}
++
+ 	if (gSP.matrix.billboard)
+ 		gSPBillboardVertex<VNUM>(v, spVtx);
+ 
