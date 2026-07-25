@@ -7,7 +7,7 @@ screen, and supported games render with genuine per-eye geometric depth driven
 by a per-game profile database.
 
 > **Status: early source release.** This is the core component; it pairs with
-> the PenguinScreen64-video plugin (the per-eye render path). Binary releases,
+> the PenguinScreen64-video-plugin (the per-eye render path). Binary releases,
 > an install kit, and setup docs arrive with the first packaged build — what's
 > here today is the source, the VR profile database, and the build
 > instructions in [QUICKSTART.md](QUICKSTART.md).

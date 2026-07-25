@@ -9,7 +9,7 @@ a broad field-testing pass yet.
 - **Source-only.** No binary packages yet; you build it yourself
   ([QUICKSTART.md](QUICKSTART.md)). Packaged releases with an install kit
   follow once the first field-validation pass completes.
-- **The video plugin ships separately** (PenguinScreen64-video). The core's VR
+- **The video plugin ships separately** (PenguinScreen64-video-plugin). The core's VR
   bridge degrades gracefully when paired with a stock video plugin: you get the
   flat screen, not per-eye depth.
 - **Profile coverage starts small.** The shipped catalog covers the launch set
