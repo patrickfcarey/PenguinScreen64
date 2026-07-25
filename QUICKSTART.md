@@ -21,7 +21,7 @@ make all
 
 The result is the core library (`libmupen64plus.so.2`). It loads into any
 Mupen64Plus frontend alongside the standard plugin set; the VR render path
-pairs with the PenguinScreen64-video plugin.
+pairs with the PenguinScreen64-video-plugin.
 
 ## VR profiles
 
