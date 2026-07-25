@@ -1,0 +1,12 @@
+/projects/unix/_obj*/
+/projects/unix/libmupen64plus*.so*
+/.vscode
+/projects/unix/*.dll
+/src/asm_defines/*.h
+
+# VR unit-test binary
+tests/vr/vrtest
+tools/vr-info/vr-info
+tools/vr-vk-info/vr-vk-info
+tools/vr-vk-probe/vr-vk-probe
+__pycache__/
