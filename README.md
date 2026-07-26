@@ -6,7 +6,10 @@ with an OpenXR presentation path: every game plays on a head-tracked virtual
 screen, and supported games render with genuine per-eye geometric depth driven
 by a per-game profile database.
 
-> **Status: early source release.** This is the core component; it pairs with
+> **Status: EXPERIMENTAL — early source release, not yet field-validated.**
+> The flagship, field-validated core of this family is PenguinScreen2 (PS2);
+> this N64 core works on the developers' hardware but has had no broad
+> testing pass. It pairs with
 > the PenguinScreen64-video-plugin (the per-eye render path). Binary releases,
 > an install kit, and setup docs arrive with the first packaged build — what's
 > here today is the source, the VR profile database, and the build
